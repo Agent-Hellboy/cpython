@@ -812,7 +812,7 @@ class Popen:
                  restore_signals=True, start_new_session=False,
                  pass_fds=(), *, user=None, group=None, extra_groups=None,
                  encoding=None, errors=None, text=None, umask=-1, pipesize=-1,
-                 process_group=None):
+                 process_group=None, err_timeout=None):
         """Create new Popen instance."""
         if not _can_fork_exec:
             raise OSError(
@@ -864,6 +864,7 @@ class Popen:
         self.encoding = encoding
         self.errors = errors
         self.pipesize = pipesize
+        self.err_timeout = err_timeout
 
         # Validate the combinations of text and universal_newlines
         if (text is not None and universal_newlines is not None
@@ -1814,6 +1815,7 @@ class Popen:
             # Data format: "exception name:hex errno:description"
             # Pickle is not used; it is complex and involves memory allocation.
             errpipe_read, errpipe_write = os.pipe()
+
             # errpipe_write must not be in the standard io 0, 1, or 2 fd range.
             low_fds_to_close = []
             while errpipe_write < 3:
@@ -1868,12 +1870,25 @@ class Popen:
 
                 # Wait for exec to fail or succeed; possibly raising an
                 # exception (limited in size)
-                errpipe_data = bytearray()
-                while True:
-                    part = os.read(errpipe_read, 50000)
-                    errpipe_data += part
-                    if not part or len(errpipe_data) > 50000:
-                        break
+                selector = selectors.DefaultSelector()
+                selector.register(errpipe_read, selectors.EVENT_READ)
+
+                def _read_from_errpipe(timeout):
+                    errpipe_data = bytearray()
+                    while True:
+                        events = selector.select(timeout=timeout)
+                        for key, _ in events:
+                            part = os.read(key.fd, 50000)
+                            os.set_blocking(errpipe_read, False)
+                            errpipe_data += part
+                            if not part or len(errpipe_data) > 50000:
+                                selector.unregister(key.fd)
+                                return errpipe_data
+                        if not events:
+                            break
+                    return errpipe_data
+                errpipe_data = _read_from_errpipe(self.err_timeout)
+
             finally:
                 # be sure the FD is closed no matter what
                 os.close(errpipe_read)
